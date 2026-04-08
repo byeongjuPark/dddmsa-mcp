@@ -18,7 +18,7 @@ Cursor IDE, Claude Desktop 등 MCP 규격을 지원하는 AI 어시스턴트에 
 
 1. **저장소 클론 및 종속성 설치**
    ```bash
-   git clone <repository_url>
+   git clone https://github.com/byeongjuPark/dddmsa-mcp.git
    cd dddmsa-mcp
    npm install
    ```
@@ -66,7 +66,7 @@ By integrating this tool into MCP-compatible AI assistants like Cursor IDE or Cl
 
 1. **Clone the repository and install dependencies:**
    ```bash
-   git clone <repository_url>
+   git clone https://github.com/byeongjuPark/dddmsa-mcp.git
    cd dddmsa-mcp
    npm install
    ```
