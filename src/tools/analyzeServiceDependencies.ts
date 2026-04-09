@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { resolveSafePath } from "../utils/pathUtils.js";
 
 interface AnalyzeArgs {
   targetPath: string;
@@ -7,7 +8,6 @@ interface AnalyzeArgs {
 
 export async function analyzeServiceDependencies(args: AnalyzeArgs) {
   const { targetPath } = args;
-  const rootDir = path.join(process.cwd(), targetPath);
   
   // Map of Dependency string -> list of file paths where it was found
   const dependencies: Map<string, Set<string>> = new Map();
@@ -20,6 +20,9 @@ export async function analyzeServiceDependencies(args: AnalyzeArgs) {
   };
 
   try {
+    const rootDir = resolveSafePath(process.cwd(), targetPath);
+    await fs.access(rootDir);
+
     // Improved Regex Patterns (TypeScript/Node)
     const httpRegex = /(?:axios\.(?:get|post|put|delete|patch|request)|fetch)\s*\(\s*['"`](https?:\/\/[^'"`]+)['"`]/g;
     const grpcRegex = /client\.([a-zA-Z0-9_]+)\(/g;

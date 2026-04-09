@@ -1,6 +1,7 @@
-import express from "express";
+﻿import express from "express";
 import cors from "cors";
-import { v4 as uuidv4 } from "uuid";
+import type { Server as HttpServer } from "node:http";
+import { pathToFileURL } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
@@ -13,22 +14,12 @@ import { generateCommunicationSpec } from "./tools/generateCommunicationSpec.js"
 import { analyzeServiceDependencies } from "./tools/analyzeServiceDependencies.js";
 import { generateTestStub } from "./tools/generateTestStub.js";
 
-const app = express();
-const port = process.env.PORT || 3001;
+export interface RunningServer {
+  port: number;
+  httpServer: HttpServer;
+  close: () => Promise<void>;
+}
 
-// 1. App middlewares
-app.use(cors());
-
-// 2. Health check
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
-});
-
-// 3. Multi-client session management
-const transports = new Map<string, SSEServerTransport>();
-const servers = new Map<string, Server>();
-
-// Function to create a server instance per connection to avoid state collision
 function createMcpServer(sessionId: string): Server {
   const server = new Server(
     {
@@ -42,7 +33,6 @@ function createMcpServer(sessionId: string): Server {
     }
   );
 
-  // Register tools
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
@@ -63,19 +53,21 @@ function createMcpServer(sessionId: string): Server {
               language: {
                 type: "string",
                 enum: ["typescript", "spring", "auto"],
-                description: "The ecosystem/language to scaffold (e.g., 'typescript', 'spring'). Default is 'auto'",
+                description:
+                  "The ecosystem/language to scaffold (e.g., 'typescript', 'spring'). Default is 'auto'",
               },
               basePackage: {
                 type: "string",
                 description: "For Spring: The base package name (e.g., 'com.example.service')",
-              }
+              },
             },
             required: ["serviceName", "targetPath"],
           },
         },
         {
           name: "validate_ddd_architecture",
-          description: "Validate the DDD architecture layers of a given directory to ensure no dependency violations.",
+          description:
+            "Validate the DDD architecture layers of a given directory to ensure no dependency violations.",
           inputSchema: {
             type: "object",
             properties: {
@@ -106,7 +98,7 @@ function createMcpServer(sessionId: string): Server {
                 type: "string",
                 enum: ["typescript", "spring", "auto"],
                 description: "The language context of the source files. Default is 'auto'",
-              }
+              },
             },
             required: ["sourcePath", "outputFormat"],
           },
@@ -139,7 +131,7 @@ function createMcpServer(sessionId: string): Server {
                 type: "string",
                 enum: ["typescript", "spring", "auto"],
                 description: "The language context. Default is 'auto'.",
-              }
+              },
             },
             required: ["targetFilePath"],
           },
@@ -148,7 +140,6 @@ function createMcpServer(sessionId: string): Server {
     };
   });
 
-  // Handle tool execution + 4. Error Handling and Server Logging Enhancements
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
@@ -189,81 +180,128 @@ function createMcpServer(sessionId: string): Server {
   return server;
 }
 
-// Start Express Server for SSE
-app.get("/mcp", async (req, res) => {
-  const sessionId = uuidv4();
-  console.log(`[MCP] New SSE connection established. Session: ${sessionId}`);
-  
-  // Construct the messages endpoint url specific to this session
-  const transport = new SSEServerTransport(`/mcp/messages?sessionId=${sessionId}`, res);
-  transports.set(sessionId, transport);
-  
-  const server = createMcpServer(sessionId);
-  servers.set(sessionId, server);
-  
-  res.on('close', async () => {
-    console.log(`[MCP] SSE connection closed. Session: ${sessionId}`);
-    
-    const s = servers.get(sessionId);
-    if (s) {
-      await s.close().catch(err => console.error("Error closing server struct", err));
+async function createApp() {
+  const app = express();
+  const transports = new Map<string, SSEServerTransport>();
+  const servers = new Map<string, Server>();
+
+  app.use(cors());
+
+  app.get("/health", (req, res) => {
+    res.json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
+  app.get("/mcp", async (req, res) => {
+    const transport = new SSEServerTransport("/mcp/messages", res);
+    const sessionId = transport.sessionId;
+    console.log(`[MCP] New SSE connection established. Session: ${sessionId}`);
+
+    const server = createMcpServer(sessionId);
+    transports.set(sessionId, transport);
+    servers.set(sessionId, server);
+    let cleanedUp = false;
+
+    const cleanup = async () => {
+      if (cleanedUp) {
+        return;
+      }
+      cleanedUp = true;
+
+      console.log(`[MCP] SSE connection closed. Session: ${sessionId}`);
+      transport.onclose = undefined;
+      transports.delete(sessionId);
+      servers.delete(sessionId);
+      await server.close().catch((err) => console.error("Error closing server struct", err));
+    };
+
+    transport.onclose = () => {
+      void cleanup();
+    };
+
+    await server.connect(transport);
+  });
+
+  app.post("/mcp/messages", async (req, res) => {
+    const sessionId = req.query.sessionId as string;
+
+    if (!sessionId) {
+      res.status(400).send("Missing sessionId in query parameters.");
+      return;
     }
 
-    transports.delete(sessionId);
-    servers.delete(sessionId);
+    const transport = transports.get(sessionId);
+    if (!transport) {
+      res.status(404).send("Session not found or inactive.");
+      return;
+    }
+
+    try {
+      await transport.handlePostMessage(req, res);
+    } catch (err: any) {
+      console.error(`[MCP] Error handling message for session ${sessionId}:`, err);
+      res.status(500).send("Message handling failed.");
+    }
   });
 
-  await server.connect(transport);
-});
+  const closeSessions = async () => {
+    await Promise.all(
+      Array.from(transports.values()).map(async (transport) => {
+        await transport.close().catch(() => {});
+      })
+    );
+    await Promise.all(
+      Array.from(servers.values()).map(async (server) => {
+        await server.close().catch(() => {});
+      })
+    );
+    transports.clear();
+    servers.clear();
+  };
 
-// Message handling endpoint per session
-app.post("/mcp/messages", express.json(), async (req, res) => {
-  const sessionId = req.query.sessionId as string;
+  return { app, closeSessions };
+}
 
-  if (!sessionId) {
-    res.status(400).send("Missing sessionId in query parameters.");
-    return;
-  }
+export async function startServer(port = Number(process.env.PORT ?? 3001)): Promise<RunningServer> {
+  const { app, closeSessions } = await createApp();
 
-  const transport = transports.get(sessionId);
-  if (!transport) {
-    res.status(404).send("Session not found or inactive.");
-    return;
-  }
-
-  try {
-    await transport.handlePostMessage(req, res);
-  } catch (err: any) {
-    console.error(`[MCP] Error handling message for session ${sessionId}:`, err);
-    res.status(500).send("Message handling failed.");
-  }
-});
-
-const httpServer = app.listen(port, () => {
-  console.log(`🚀 DDD+MSA MCP Server is running in SSE mode: http://localhost:${port}/mcp`);
-  console.log(`🩺 Health check URL: http://localhost:${port}/health`);
-  console.log(`Add this URL to your Vibe Coding IDE to use the tools over the network.`);
-});
-
-// 5. Graceful shutdown
-const shutdown = () => {
-  console.log("\n[Server] Received shutdown signal. Shutting down gracefully...");
-  
-  transports.forEach(async (t) => {
-    await t.close().catch(() => {});
+  const httpServer = await new Promise<HttpServer>((resolve) => {
+    const server = app.listen(port, () => resolve(server));
   });
-  servers.forEach(async (s) => {
-    await s.close().catch(() => {});
-  });
-  
-  transports.clear();
-  servers.clear();
 
-  httpServer.close(() => {
+  const address = httpServer.address();
+  const resolvedPort = typeof address === "object" && address !== null ? address.port : port;
+
+  return {
+    port: resolvedPort,
+    httpServer,
+    close: async () => {
+      await closeSessions();
+      await new Promise<void>((resolve) => {
+        httpServer.close(() => resolve());
+      });
+    },
+  };
+}
+
+const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMainModule) {
+  const running = await startServer(Number(process.env.PORT ?? 3001));
+  console.log(`DDD+MSA MCP Server is running in SSE mode: http://localhost:${running.port}/mcp`);
+  console.log(`Health check URL: http://localhost:${running.port}/health`);
+  console.log("Add this URL to your Vibe Coding IDE to use the tools over the network.");
+
+  const shutdown = async () => {
+    console.log("\n[Server] Received shutdown signal. Shutting down gracefully...");
+    await running.close();
     console.log("[Server] Closed HTTP server. Process exiting.");
     process.exit(0);
-  });
-};
+  };
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => {
+    void shutdown();
+  });
+  process.on("SIGTERM", () => {
+    void shutdown();
+  });
+}
