@@ -56,6 +56,7 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
                  }
                  if (isJava) {
                    // Fallback regex for Java until java-parser visitor is fully implemented
+                   let match;
                    let classLevelPath = "";
                    const classMappingMatch = classReqMappingRegex.exec(content);
                    if (classMappingMatch) {
