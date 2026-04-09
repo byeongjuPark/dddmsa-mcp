@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { resolveSafePath } from "../utils/pathUtils.js";
 
 interface GenerateTestArgs {
   targetFilePath: string;
@@ -16,7 +17,7 @@ export async function generateTestStub(args: GenerateTestArgs) {
   let { targetFilePath, language = "auto" } = args;
 
   try {
-    const fullSourcePath = path.join(process.cwd(), targetFilePath);
+    const fullSourcePath = resolveSafePath(process.cwd(), targetFilePath);
     
     // Check if source file exists
     try {

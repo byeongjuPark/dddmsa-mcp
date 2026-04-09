@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { resolveSafePath } from "../utils/pathUtils.js";
 
 interface GenerateSpecArgs {
   sourcePath: string;
@@ -8,14 +9,16 @@ interface GenerateSpecArgs {
 
 export async function generateCommunicationSpec(args: GenerateSpecArgs) {
   const { sourcePath, outputFormat } = args;
-  const targetDir = path.join(process.cwd(), sourcePath);
+  const targetDir = resolveSafePath(process.cwd(), sourcePath);
 
   try {
     const endpoints: { method: string, path: string }[] = [];
+    const warnings: string[] = [];
 
     // Simple Regex for detecting endpoints
     const tsRegex = /\.(get|post|put|delete|patch)\s*\(\s*['"]([^'"]+)['"]/g;
-    const springRegex = /@(Get|Post|Put|Delete|Patch)Mapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/g;
+    const springRegex = /@(Get|Post|Put|Delete|Patch)Mapping(?:\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["']([^"']*)["']\s*\))?/g;
+    const classReqMappingRegex = /@RequestMapping\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["']([^"']+)["']\s*\)/;
 
     async function walk(dir: string) {
       try {
@@ -30,22 +33,39 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
              const isJava = ext === '.java' || ext === '.kt';
              
              if (isTS || isJava) {
-               const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
-               let match;
-               if (isTS) {
-                 while ((match = tsRegex.exec(content)) !== null) {
-                   endpoints.push({ method: match[1].toLowerCase(), path: match[2] });
+               try {
+                 const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
+                 let match;
+                 if (isTS) {
+                   while ((match = tsRegex.exec(content)) !== null) {
+                     endpoints.push({ method: match[1].toLowerCase(), path: match[2] });
+                   }
                  }
-               }
-               if (isJava) {
-                 while ((match = springRegex.exec(content)) !== null) {
-                   endpoints.push({ method: match[1].toLowerCase(), path: match[2] });
+                 if (isJava) {
+                   let classLevelPath = "";
+                   const classMappingMatch = classReqMappingRegex.exec(content);
+                   if (classMappingMatch) {
+                     classLevelPath = classMappingMatch[1];
+                   }
+
+                   while ((match = springRegex.exec(content)) !== null) {
+                     const methodPath = match[2] || "";
+                     let fullPath = (classLevelPath + (classLevelPath.endsWith('/') || methodPath.startsWith('/') || methodPath === '' ? '' : '/') + methodPath).replace(/\/\/+/g, '/');
+                     if (!fullPath.startsWith('/')) fullPath = '/' + fullPath;
+                     if (fullPath.endsWith('/') && fullPath.length > 1) fullPath = fullPath.slice(0, -1);
+
+                     endpoints.push({ method: match[1].toLowerCase(), path: fullPath });
+                   }
                  }
+               } catch (err: any) {
+                 warnings.push(`Warning: Could not read file ${path.join(dir, entry.name)}: ${err.message}`);
                }
              }
            }
         }
-      } catch (e) {}
+      } catch (e: any) {
+        warnings.push(`Warning: directory walk failed for ${dir}: ${e.message}`);
+      }
     }
 
     await walk(targetDir);
@@ -94,7 +114,8 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
           type: "text",
           text: `Successfully scanned project and generated ${outputFormat.toUpperCase()} spec with ${endpoints.length} endpoints at ${outputPath}`,
         },
-      ],
+        ...(warnings.length > 0 ? [{ type: "text", text: `\nWarnings encountered:\n${warnings.join('\n')}` }] : [])
+      ] as any,
     };
   } catch (error: any) {
     return {
