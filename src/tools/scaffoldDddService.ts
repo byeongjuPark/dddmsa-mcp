@@ -7,6 +7,8 @@ interface ScaffoldArgs {
   serviceName: string;
   language?: "typescript" | "spring" | "auto";
   basePackage?: string;
+  dryRun?: boolean;
+  overwrite?: boolean;
 }
 
 async function detectLanguage(basePath: string): Promise<"typescript" | "spring"> {
@@ -58,7 +60,7 @@ async function detectBasePackage(basePath: string): Promise<string> {
 }
 
 export async function scaffoldDddService(args: ScaffoldArgs) {
-  let { targetPath, serviceName, language = "auto", basePackage } = args;
+  let { targetPath, serviceName, language = "auto", basePackage, dryRun = false, overwrite = false } = args;
 
   try {
     const projectRoot = process.cwd();
@@ -72,7 +74,17 @@ export async function scaffoldDddService(args: ScaffoldArgs) {
 
     const rootDir = resolveSafePath(projectRoot, path.join(targetPath, serviceName));
 
+    if (!overwrite) {
+      try {
+        await fs.access(rootDir);
+        throw new Error(`Directory ${rootDir} already exists. Pass 'overwrite: true' to force.`);
+      } catch (e: any) {
+        if (e.message.includes('already exists')) throw e;
+      }
+    }
+
     let directories: string[] = [];
+    const plannedWrites: string[] = [];
     
     if (language === "spring") {
       const pkg = basePackage || "com.example.service";
@@ -133,6 +145,22 @@ dependencies {
         "presentation/routes",
         "presentation/middlewares",
       ];
+    }
+
+    for (const dir of directories) {
+      plannedWrites.push(path.join(rootDir, dir, ".gitkeep"));
+    }
+    plannedWrites.push(path.join(rootDir, "README.md"));
+
+    if (dryRun) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `[DRY RUN] Scaffold planned for '${serviceName}' at ${rootDir}:\n` + plannedWrites.map(p => `+ ${p}`).join('\n')
+          }
+        ]
+      }
     }
 
     for (const dir of directories) {

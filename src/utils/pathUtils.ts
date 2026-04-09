@@ -1,4 +1,5 @@
 import path from "path";
+import fs from "fs";
 
 /**
  * Resolves the given user input path against the base path and ensures it does not escape the base path.
@@ -20,10 +21,25 @@ export function resolveSafePath(basePath: string, userInputPath: string): string
         throw new Error(`Security Violation: Path traversal detected. Expected path inside '${basePath}', got '${resolvedPath}'`);
     }
 
-    // Alternatively, verify with relative
-    const relative = path.relative(basePath, resolvedPath);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) {
-        throw new Error(`Security Violation: Path traversal detected. Expected path inside '${basePath}', got '${resolvedPath}'`);
+    try {
+        if (fs.existsSync(resolvedPath)) {
+            const realPath = fs.realpathSync(resolvedPath);
+            const normalizedReal = path.normalize(realPath).replace(/\\/g, '/');
+            if (!normalizedReal.startsWith(normalizedBase)) {
+                throw new Error(`Security Violation: Symlink escapes the base directory. Expected path inside '${basePath}', got '${realPath}'`);
+            }
+        }
+    } catch (e) {
+        // file doesn't exist yet, that's okay
+    }
+
+    const allowListEnv = process.env.WORKSPACE_ALLOWLIST;
+    if (allowListEnv) {
+        const allowedPaths = allowListEnv.split(',').map(p => path.normalize(p.trim()).replace(/\\/g, '/'));
+        const isAllowed = allowedPaths.some(allowed => normalizedResolved.startsWith(allowed));
+        if (!isAllowed) {
+            throw new Error(`Security Violation: Path is not within the WORKSPACE_ALLOWLIST bounds.`);
+        }
     }
 
     return resolvedPath;

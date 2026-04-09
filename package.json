@@ -17,12 +17,19 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.6",
-    "express": "^5.2.1"
+    "diff": "^5.2.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.1.5",
+    "java-parser": "^2.0.4",
+    "pino": "^9.0.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
+    "@types/diff": "^5.2.1",
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.2",
+    "@types/pino": "^7.0.5",
+    "pino-pretty": "^11.0.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.3"

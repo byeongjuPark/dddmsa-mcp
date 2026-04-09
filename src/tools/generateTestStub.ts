@@ -1,10 +1,13 @@
 import fs from "fs/promises";
 import path from "path";
+import * as Diff from "diff";
 import { resolveSafePath } from "../utils/pathUtils.js";
 
 interface GenerateTestArgs {
   targetFilePath: string;
   language?: "typescript" | "spring" | "auto";
+  dryRun?: boolean;
+  overwrite?: boolean;
 }
 
 async function detectLanguage(targetFilePath: string): Promise<"typescript" | "spring"> {
@@ -14,7 +17,7 @@ async function detectLanguage(targetFilePath: string): Promise<"typescript" | "s
 }
 
 export async function generateTestStub(args: GenerateTestArgs) {
-  let { targetFilePath, language = "auto" } = args;
+  let { targetFilePath, language = "auto", dryRun = false, overwrite = false } = args;
 
   try {
     const fullSourcePath = resolveSafePath(process.cwd(), targetFilePath);
@@ -98,7 +101,30 @@ describe('${className}', () => {
 `;
     }
 
-    const fullTestPath = path.join(process.cwd(), testFilePath);
+    const fullTestPath = resolveSafePath(process.cwd(), testFilePath);
+
+    let existingContent = "";
+    try {
+      existingContent = await fs.readFile(fullTestPath, "utf-8");
+      if (!overwrite) {
+        throw new Error(`Test file already exists at ${testFilePath}. Pass 'overwrite: true' to force.`);
+      }
+    } catch (e: any) {
+      if (e.message.includes('already exists')) throw e;
+    }
+
+    if (dryRun) {
+      let diffStr = "";
+      if (existingContent) {
+        const patch = Diff.createTwoFilesPatch(testFilePath, testFilePath, existingContent, testContent, "Existing", "New");
+        diffStr = `[DRY RUN] Diff of modifications to ${testFilePath}:\n\n${patch}`;
+      } else {
+        diffStr = `[DRY RUN] Would create ${testFilePath} with the following content:\n\n${testContent}`;
+      }
+      return {
+        content: [{ type: "text", text: diffStr }]
+      };
+    }
     
     // Create necessary directories for the test file
     await fs.mkdir(path.dirname(fullTestPath), { recursive: true });

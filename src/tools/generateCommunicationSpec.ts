@@ -1,6 +1,8 @@
 import fs from "fs/promises";
 import path from "path";
+import ts from "typescript";
 import { resolveSafePath } from "../utils/pathUtils.js";
+import { ToolResult } from "../types/ResultTypes.js";
 
 interface GenerateSpecArgs {
   sourcePath: string;
@@ -35,13 +37,25 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
              if (isTS || isJava) {
                try {
                  const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
-                 let match;
                  if (isTS) {
-                   while ((match = tsRegex.exec(content)) !== null) {
-                     endpoints.push({ method: match[1].toLowerCase(), path: match[2] });
-                   }
+                   const sourceFile = ts.createSourceFile("temp.ts", content, ts.ScriptTarget.Latest, true);
+                   ts.forEachChild(sourceFile, function visit(node: ts.Node) {
+                       if (ts.isCallExpression(node)) {
+                           const exp = node.expression;
+                           if (ts.isPropertyAccessExpression(exp)) {
+                               const method = exp.name.text;
+                               if (['get', 'post', 'put', 'delete', 'patch'].includes(method)) {
+                                   if (node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0])) {
+                                        endpoints.push({ method, path: node.arguments[0].text });
+                                   }
+                               }
+                           }
+                       }
+                       ts.forEachChild(node, visit);
+                   });
                  }
                  if (isJava) {
+                   // Fallback regex for Java until java-parser visitor is fully implemented
                    let classLevelPath = "";
                    const classMappingMatch = classReqMappingRegex.exec(content);
                    if (classMappingMatch) {
@@ -108,14 +122,24 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
     const outputPath = path.join(targetDir, fileName);
     await fs.writeFile(outputPath, specContent);
 
+    const results: ToolResult[] = [];
+    results.push({
+      ruleId: "SPEC-GEN",
+      confidence: 1.0,
+      evidence: endpoints.map(ep => ({ file: outputPath, message: `Discovered endpoint ${ep.method.toUpperCase()} ${ep.path}` })),
+    });
+
+    if (warnings.length > 0) {
+       results.push({
+          ruleId: "SPEC-GEN-WARN",
+          confidence: 1.0,
+          evidence: warnings.map(w => ({ file: targetDir, message: w })),
+          errorCode: "WARNING"
+       });
+    }
+
     return {
-      content: [
-        {
-          type: "text",
-          text: `Successfully scanned project and generated ${outputFormat.toUpperCase()} spec with ${endpoints.length} endpoints at ${outputPath}`,
-        },
-        ...(warnings.length > 0 ? [{ type: "text", text: `\nWarnings encountered:\n${warnings.join('\n')}` }] : [])
-      ] as any,
+      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
     };
   } catch (error: any) {
     return {
