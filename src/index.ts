@@ -109,6 +109,14 @@ function createMcpServer(sessionId: string): Server {
                 enum: ["typescript", "spring", "auto"],
                 description: "The language context of the source files. Default is 'auto'",
               },
+              dryRun: {
+                type: "boolean",
+                description: "If true, diff preview without writing."
+              },
+              overwrite: {
+                type: "boolean",
+                description: "If true, overwrites existing spec files."
+              }
             },
             required: ["sourcePath", "outputFormat"],
           },
@@ -188,14 +196,29 @@ function createMcpServer(sessionId: string): Server {
       
       const durationMs = Date.now() - startTime;
       logger.info({ sessionId, toolName: name, durationMs, status: "success" }, `[MCP Tool Success] ${name} completed in ${durationMs}ms`);
+      
+      // Prometheus-style metrics event
+      logger.info({ metric: 'mcp_tool_execution_count', tags: { toolName: name, status: 'success' }, value: 1 }, `METRIC mcp_tool_execution_count 1`);
+      logger.info({ metric: 'mcp_tool_execution_latency_ms', tags: { toolName: name }, value: durationMs }, `METRIC mcp_tool_execution_latency_ms ${durationMs}`);
+
       return result;
 
     } catch (error: any) {
       const durationMs = Date.now() - startTime;
       logger.error({ sessionId, toolName: name, durationMs, status: "error", errorCode: error.code || "UNKNOWN", error: error.message, stack: error.stack }, `[MCP Tool Error] Error executing tool ${name}: ${error.message}`);
       
+      // Prometheus-style metrics event
+      logger.info({ metric: 'mcp_tool_execution_count', tags: { toolName: name, status: 'error' }, value: 1 }, `METRIC mcp_tool_execution_count 1`);
+
+      const errorResults = [{
+         ruleId: "TOOL-EXEC-FAIL",
+         confidence: 0,
+         errorCode: error.code || "UNKNOWN_ERR",
+         evidence: [{ file: "internal", message: error.message }]
+      }];
+
       return {
-        content: [{ type: "text", text: `Error executing tool ${name}: ${error.message}` }],
+        content: [{ type: "text", text: JSON.stringify(errorResults, null, 2) }],
         isError: true,
       };
     }

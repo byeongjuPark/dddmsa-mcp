@@ -3,24 +3,23 @@ import path from "path";
 import ts from "typescript";
 import { resolveSafePath } from "../utils/pathUtils.js";
 import { ToolResult } from "../types/ResultTypes.js";
+import * as Diff from "diff";
+import { extractJavaDataFromAST } from "../utils/javaCstWalker.js";
 
 interface GenerateSpecArgs {
   sourcePath: string;
   outputFormat: "openapi" | "grpc";
+  dryRun?: boolean;
+  overwrite?: boolean;
 }
 
 export async function generateCommunicationSpec(args: GenerateSpecArgs) {
-  const { sourcePath, outputFormat } = args;
+  const { sourcePath, outputFormat, dryRun = false, overwrite = false } = args;
   const targetDir = resolveSafePath(process.cwd(), sourcePath);
 
   try {
     const endpoints: { method: string, path: string }[] = [];
     const warnings: string[] = [];
-
-    // Simple Regex for detecting endpoints
-    const tsRegex = /\.(get|post|put|delete|patch)\s*\(\s*['"]([^'"]+)['"]/g;
-    const springRegex = /@(Get|Post|Put|Delete|Patch)Mapping(?:\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["']([^"']*)["']\s*\))?/g;
-    const classReqMappingRegex = /@RequestMapping\s*\(\s*(?:value\s*=\s*|path\s*=\s*)?["']([^"']+)["']\s*\)/;
 
     async function walk(dir: string) {
       try {
@@ -55,22 +54,10 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
                    });
                  }
                  if (isJava) {
-                   // Fallback regex for Java until java-parser visitor is fully implemented
-                   let match;
-                   let classLevelPath = "";
-                   const classMappingMatch = classReqMappingRegex.exec(content);
-                   if (classMappingMatch) {
-                     classLevelPath = classMappingMatch[1];
-                   }
-
-                   while ((match = springRegex.exec(content)) !== null) {
-                     const methodPath = match[2] || "";
-                     let fullPath = (classLevelPath + (classLevelPath.endsWith('/') || methodPath.startsWith('/') || methodPath === '' ? '' : '/') + methodPath).replace(/\/\/+/g, '/');
-                     if (!fullPath.startsWith('/')) fullPath = '/' + fullPath;
-                     if (fullPath.endsWith('/') && fullPath.length > 1) fullPath = fullPath.slice(0, -1);
-
-                     endpoints.push({ method: match[1].toLowerCase(), path: fullPath });
-                   }
+                   try {
+                       const extraction = extractJavaDataFromAST(content);
+                       extraction.endpoints.forEach(ep => endpoints.push(ep));
+                   } catch(e) {}
                  }
                } catch (err: any) {
                  warnings.push(`Warning: Could not read file ${path.join(dir, entry.name)}: ${err.message}`);
@@ -121,6 +108,36 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
     }
 
     const outputPath = path.join(targetDir, fileName);
+    
+    let existingContent = "";
+    try {
+        existingContent = await fs.readFile(outputPath, 'utf-8');
+        if (!overwrite) {
+            throw new Error(`Spec already exists at ${outputPath}. Pass 'overwrite: true' to force.`);
+        }
+    } catch (e: any) {
+        if (e.message.includes('already exists')) throw e;
+    }
+
+    if (dryRun) {
+        let diffStr = "";
+        if (existingContent) {
+           const patch = Diff.createTwoFilesPatch(fileName, fileName, existingContent, specContent, "Existing", "New");
+           diffStr = `[DRY RUN] Diff of modifications:\n\n${patch}`;
+        } else {
+           diffStr = `[DRY RUN] Would create with content:\n\n${specContent}`;
+        }
+        
+        const dryRunResults: ToolResult[] = [{
+           ruleId: "SPEC-DRY",
+           confidence: 1.0,
+           evidence: [{ file: outputPath, message: diffStr }]
+        }];
+        return {
+           content: [{ type: "text", text: JSON.stringify(dryRunResults, null, 2) }]
+        }
+    }
+
     await fs.writeFile(outputPath, specContent);
 
     const results: ToolResult[] = [];

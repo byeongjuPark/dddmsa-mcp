@@ -3,6 +3,7 @@ import path from "path";
 import ts from "typescript";
 import { resolveSafePath } from "../utils/pathUtils.js";
 import { ToolResult } from "../types/ResultTypes.js";
+import { extractJavaDataFromAST } from "../utils/javaCstWalker.js";
 
 interface ValidateArgs {
   targetPath: string;
@@ -16,9 +17,6 @@ export async function validateDddArchitecture(args: ValidateArgs) {
 
   try {
     await fs.access(rootDir);
-
-    // Regex for Java/Kotlin imports
-    const javaImportRegex = /import\s+(.*?);?/g;
 
     async function walk(dir: string, layer: string) {
       try {
@@ -60,12 +58,14 @@ export async function validateDddArchitecture(args: ValidateArgs) {
 
                   extractImports(sourceFile);
                 }
-                
                 if (isJava) {
-                  let match;
-                  while ((match = javaImportRegex.exec(content)) !== null) {
-                    const importPath = match[1];
-                    checkViolation(fullPath, importPath, layer, ".application.", ".infrastructure.", ".presentation.");
+                  try {
+                    const extraction = extractJavaDataFromAST(content);
+                    extraction.imports.forEach(importPath => {
+                      checkViolation(fullPath, importPath, layer, ".application.", ".infrastructure.", ".presentation.");
+                    });
+                  } catch (e: any) {
+                    errors.push(`Java AST extraction failed for ${fullPath}: ${e.message}`);
                   }
                 }
               } catch (err: any) {
@@ -139,8 +139,14 @@ export async function validateDddArchitecture(args: ValidateArgs) {
       content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
     };
   } catch (error: any) {
+    const errorResults: ToolResult[] = [{
+       ruleId: "VAL-FAIL",
+       confidence: 0,
+       errorCode: "VAL_ERR",
+       evidence: [{ file: targetPath, message: error.message }]
+    }];
     return {
-      content: [{ type: "text", text: `Failed to validate architecture: ${error.message}` }],
+      content: [{ type: "text", text: JSON.stringify(errorResults, null, 2) }],
       isError: true,
     };
   }

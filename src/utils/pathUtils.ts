@@ -16,8 +16,11 @@ export function resolveSafePath(basePath: string, userInputPath: string): string
     const normalizedBase = path.normalize(basePath).replace(/\\/g, '/');
     const normalizedResolved = path.normalize(resolvedPath).replace(/\\/g, '/');
     
+    const normalizedBaseC = normalizedBase.endsWith('/') ? normalizedBase : normalizedBase + '/';
+    const normalizedResolvedC = normalizedResolved.endsWith('/') ? normalizedResolved : normalizedResolved + '/';
+
     // Check if the resolved path starts with the base path
-    if (!normalizedResolved.startsWith(normalizedBase)) {
+    if (!normalizedResolvedC.startsWith(normalizedBaseC)) {
         throw new Error(`Security Violation: Path traversal detected. Expected path inside '${basePath}', got '${resolvedPath}'`);
     }
 
@@ -25,7 +28,8 @@ export function resolveSafePath(basePath: string, userInputPath: string): string
         if (fs.existsSync(resolvedPath)) {
             const realPath = fs.realpathSync(resolvedPath);
             const normalizedReal = path.normalize(realPath).replace(/\\/g, '/');
-            if (!normalizedReal.startsWith(normalizedBase)) {
+            const normalizedRealC = normalizedReal.endsWith('/') ? normalizedReal : normalizedReal + '/';
+            if (!normalizedRealC.startsWith(normalizedBaseC)) {
                 throw new Error(`Security Violation: Symlink escapes the base directory. Expected path inside '${basePath}', got '${realPath}'`);
             }
         }
@@ -35,8 +39,11 @@ export function resolveSafePath(basePath: string, userInputPath: string): string
 
     const allowListEnv = process.env.WORKSPACE_ALLOWLIST;
     if (allowListEnv) {
-        const allowedPaths = allowListEnv.split(',').map(p => path.normalize(p.trim()).replace(/\\/g, '/'));
-        const isAllowed = allowedPaths.some(allowed => normalizedResolved.startsWith(allowed));
+        const allowedPaths = allowListEnv.split(',').map(p => {
+             const np = path.normalize(p.trim()).replace(/\\/g, '/');
+             return np.endsWith('/') ? np : np + '/';
+        });
+        const isAllowed = allowedPaths.some(allowed => normalizedResolvedC.startsWith(allowed));
         if (!isAllowed) {
             throw new Error(`Security Violation: Path is not within the WORKSPACE_ALLOWLIST bounds.`);
         }
