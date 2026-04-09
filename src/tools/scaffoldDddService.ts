@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { resolveSafePath } from "../utils/pathUtils.js";
 
 interface ScaffoldArgs {
   targetPath: string;
@@ -17,8 +18,8 @@ async function detectLanguage(basePath: string): Promise<"typescript" | "spring"
     if (files.includes("package.json") || files.includes("tsconfig.json")) {
       return "typescript";
     }
-  } catch (e) {
-    // ignore
+  } catch (e: any) {
+    console.warn(`[Warning] detectLanguage failed: ${e.message}. Falling back to 'typescript'.`);
   }
   return "typescript"; // default fallback
 }
@@ -49,7 +50,9 @@ async function detectBasePackage(basePath: string): Promise<string> {
     }
     const foundPkg = await searchJavaPath(basePath, 0);
     if (foundPkg) return foundPkg;
-  } catch (e) {}
+  } catch (e: any) {
+    console.warn(`[Warning] detectBasePackage failed: ${e.message}. Falling back to 'com.example.service'.`);
+  }
 
   return "com.example.service";
 }
@@ -67,7 +70,7 @@ export async function scaffoldDddService(args: ScaffoldArgs) {
       basePackage = await detectBasePackage(projectRoot);
     }
 
-    const rootDir = path.join(projectRoot, targetPath, serviceName);
+    const rootDir = resolveSafePath(projectRoot, path.join(targetPath, serviceName));
 
     let directories: string[] = [];
     

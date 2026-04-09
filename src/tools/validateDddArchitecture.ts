@@ -1,5 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
+import ts from "typescript";
+import { resolveSafePath } from "../utils/pathUtils.js";
 
 interface ValidateArgs {
   targetPath: string;
@@ -7,12 +9,11 @@ interface ValidateArgs {
 
 export async function validateDddArchitecture(args: ValidateArgs) {
   const { targetPath } = args;
-  const rootDir = path.join(process.cwd(), targetPath);
+  const rootDir = resolveSafePath(process.cwd(), targetPath);
   const violations: string[] = [];
+  const errors: string[] = [];
 
   try {
-    // Regex for TypeScript/JS imports
-    const tsImportRegex = /import\s+.*?\s+from\s+['"](.*?)['"];/g;
     // Regex for Java/Kotlin imports
     const javaImportRegex = /import\s+(.*?);?/g;
 
@@ -28,28 +29,51 @@ export async function validateDddArchitecture(args: ValidateArgs) {
             const isJava = entry.name.endsWith('.java') || entry.name.endsWith('.kt');
 
             if (isTS || isJava) {
-              const content = await fs.readFile(fullPath, "utf-8");
-              let match;
-              
-              if (isTS) {
-                while ((match = tsImportRegex.exec(content)) !== null) {
-                  const importPath = match[1];
-                  checkViolation(fullPath, importPath, layer, "application", "infrastructure", "presentation");
+              try {
+                const content = await fs.readFile(fullPath, "utf-8");
+                
+                if (isTS) {
+                  const sourceFile = ts.createSourceFile(
+                    fullPath,
+                    content,
+                    ts.ScriptTarget.Latest,
+                    true
+                  );
+
+                  function extractImports(node: ts.Node) {
+                    if (ts.isImportDeclaration(node)) {
+                      const moduleSpecifier = node.moduleSpecifier;
+                      if (ts.isStringLiteral(moduleSpecifier)) {
+                        checkViolation(fullPath, moduleSpecifier.text, layer, "application", "infrastructure", "presentation");
+                      }
+                    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+                      const arg = node.arguments[0];
+                      if (arg && ts.isStringLiteral(arg)) {
+                        checkViolation(fullPath, arg.text, layer, "application", "infrastructure", "presentation");
+                      }
+                    }
+                    ts.forEachChild(node, extractImports);
+                  }
+
+                  extractImports(sourceFile);
                 }
-              }
-              
-              if (isJava) {
-                while ((match = javaImportRegex.exec(content)) !== null) {
-                  const importPath = match[1];
-                  checkViolation(fullPath, importPath, layer, ".application.", ".infrastructure.", ".presentation.");
+                
+                if (isJava) {
+                  let match;
+                  while ((match = javaImportRegex.exec(content)) !== null) {
+                    const importPath = match[1];
+                    checkViolation(fullPath, importPath, layer, ".application.", ".infrastructure.", ".presentation.");
+                  }
                 }
+              } catch (err: any) {
+                errors.push(`Error reading file ${fullPath}: ${err.message}`);
               }
             }
           }
         }
       } catch (err: any) {
         if (err.code !== 'ENOENT') {
-          console.error(`Error walking directory ${dir}:`, err);
+          errors.push(`Error walking directory ${dir}: ${err.message}`);
         }
       }
     }
@@ -85,13 +109,15 @@ export async function validateDddArchitecture(args: ValidateArgs) {
 
     await findAndWalkLayers(rootDir);
     
-    if (violations.length === 0) {
+    const combinedIssues = [...violations, ...errors];
+
+    if (combinedIssues.length === 0) {
       return {
         content: [{ type: "text", text: `✅ Architecture validation passed for ${targetPath}. No DDD dependency violations found.` }],
       };
     } else {
       return {
-        content: [{ type: "text", text: `❌ Architecture violations found in ${targetPath}:\n\n` + violations.join('\n') }],
+        content: [{ type: "text", text: `❌ Issues found in ${targetPath}:\n\n${combinedIssues.join('\n')}` }],
       };
     }
   } catch (error: any) {
