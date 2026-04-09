@@ -14,6 +14,8 @@ export async function validateDddArchitecture(args: ValidateArgs) {
   const errors: string[] = [];
 
   try {
+    await fs.access(rootDir);
+
     // Regex for Java/Kotlin imports
     const javaImportRegex = /import\s+(.*?);?/g;
 
@@ -104,7 +106,11 @@ export async function validateDddArchitecture(args: ValidateArgs) {
              else await findAndWalkLayers(path.join(dir, entry.name));
            }
          }
-      } catch (e) {}
+      } catch (e: any) {
+        if (e.code !== "ENOENT") {
+          errors.push(`Error walking directory ${dir}: ${e.message}`);
+        }
+      }
     }
 
     await findAndWalkLayers(rootDir);
