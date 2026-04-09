@@ -4,6 +4,7 @@ import ts from "typescript";
 import { parse } from "java-parser";
 import { resolveSafePath } from "../utils/pathUtils.js";
 import { ToolResult } from "../types/ResultTypes.js";
+import { extractJavaDataFromAST } from "../utils/javaCstWalker.js";
 
 interface AnalyzeArgs {
   targetPath: string;
@@ -25,18 +26,6 @@ export async function analyzeServiceDependencies(args: AnalyzeArgs) {
   try {
     const rootDir = resolveSafePath(process.cwd(), targetPath);
     await fs.access(rootDir);
-
-    // Improved Regex Patterns (TypeScript/Node)
-    const httpRegex = /(?:axios\.(?:get|post|put|delete|patch|request)|fetch)\s*\(\s*['"`](https?:\/\/[^'"`]+)['"`]/g;
-    const grpcRegex = /client\.([a-zA-Z0-9_]+)\(/g;
-    const eventRegex = /(?:\.emit|\.publish|\.send)\s*\(\s*['"`]([^'"`]+)['"`]/g;
-    const dbRegex = /from\s+['"](mongoose|sequelize|pg|mysql2|redis|ioredis|mongodb)['"]/g;
-
-    // Regex Patterns (Java/Spring Boot)
-    const springFeignRegex = /@FeignClient\s*\(\s*(?:name|value)?\s*=?\s*["']([^"']+)["']/g;
-    const springHttpRegex = /(?:RestTemplate|WebClient).*?\.(?:getForObject|postForEntity|exchange|get|post)\s*\(\s*["'](http.*?)["']/g;
-    const springEventRegex = /(?:KafkaTemplate|RabbitTemplate).*?\.(?:send|convertAndSend)\s*\(\s*["']([^"']+)["']/g;
-    const springDbRegex = /extends\s+(JpaRepository|MongoRepository|CrudRepository|ReactiveMongoRepository)/g;
 
     async function walk(dir: string) {
       try {
@@ -97,11 +86,12 @@ export async function analyzeServiceDependencies(args: AnalyzeArgs) {
             }
 
             if (isJava) {
-              try { parse(content); } catch (e) {} // validates Java syntax
-              while ((match = springFeignRegex.exec(content)) !== null) addDependency(`FeignClient: ${match[1]}`, relativePath);
-              while ((match = springHttpRegex.exec(content)) !== null) addDependency(`HTTP API: ${match[1]}`, relativePath);
-              while ((match = springEventRegex.exec(content)) !== null) addDependency(`Event/Message (Kafka/Rabbit): ${match[1]}`, relativePath);
-              while ((match = springDbRegex.exec(content)) !== null) addDependency(`Database Access: ${match[1]}`, relativePath);
+              try {
+                  const extraction = extractJavaDataFromAST(content);
+                  extraction.dependencies.forEach(dep => {
+                      addDependency(dep, relativePath);
+                  });
+              } catch (e) {}
             }
           }
         }
@@ -136,8 +126,14 @@ export async function analyzeServiceDependencies(args: AnalyzeArgs) {
       content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
     };
   } catch (error: any) {
+    const errorResults: ToolResult[] = [{
+       ruleId: "DEP-FAIL",
+       confidence: 0,
+       errorCode: "DEP_ERR",
+       evidence: [{ file: targetPath, message: error.message }]
+    }];
     return {
-      content: [{ type: "text", text: `Failed to analyze dependencies: ${error.message}` }],
+      content: [{ type: "text", text: JSON.stringify(errorResults, null, 2) }],
       isError: true,
     };
   }
