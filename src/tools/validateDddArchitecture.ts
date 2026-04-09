@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import ts from "typescript";
 import { resolveSafePath } from "../utils/pathUtils.js";
+import { ToolResult } from "../types/ResultTypes.js";
 
 interface ValidateArgs {
   targetPath: string;
@@ -10,7 +11,7 @@ interface ValidateArgs {
 export async function validateDddArchitecture(args: ValidateArgs) {
   const { targetPath } = args;
   const rootDir = resolveSafePath(process.cwd(), targetPath);
-  const violations: string[] = [];
+  const results: ToolResult[] = [];
   const errors: string[] = [];
 
   try {
@@ -83,13 +84,23 @@ export async function validateDddArchitecture(args: ValidateArgs) {
     function checkViolation(fullPath: string, importPath: string, layer: string, appKey: string, infraKey: string, presKey: string) {
       if (layer === "domain") {
         if (importPath.includes(appKey) || importPath.includes(infraKey) || importPath.includes(presKey)) {
-          violations.push(`Violation in ${fullPath}: Domain layer must not depend on ${importPath}`);
+          results.push({
+            ruleId: "DDD-001",
+            confidence: 1.0,
+            evidence: [{ file: fullPath, message: `Domain layer depends on ${importPath}` }],
+            errorCode: "DEPENDENCY_VIOLATION"
+          });
         }
       }
       
       if (layer === "application") {
         if (importPath.includes(infraKey) || importPath.includes(presKey)) {
-          violations.push(`Violation in ${fullPath}: Application layer must not depend on ${importPath}`);
+          results.push({
+             ruleId: "DDD-002",
+             confidence: 1.0,
+             evidence: [{ file: fullPath, message: `Application layer depends on ${importPath}` }],
+             errorCode: "DEPENDENCY_VIOLATION"
+          });
         }
       }
     }
@@ -115,17 +126,18 @@ export async function validateDddArchitecture(args: ValidateArgs) {
 
     await findAndWalkLayers(rootDir);
     
-    const combinedIssues = [...violations, ...errors];
-
-    if (combinedIssues.length === 0) {
-      return {
-        content: [{ type: "text", text: `✅ Architecture validation passed for ${targetPath}. No DDD dependency violations found.` }],
-      };
-    } else {
-      return {
-        content: [{ type: "text", text: `❌ Issues found in ${targetPath}:\n\n${combinedIssues.join('\n')}` }],
-      };
+    if (errors.length > 0) {
+      results.push({
+        ruleId: "AST-PARSE-ERR",
+        confidence: 1.0,
+        evidence: errors.map(e => ({ file: targetPath, message: e })),
+        errorCode: "PARSE_ERROR"
+      });
     }
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+    };
   } catch (error: any) {
     return {
       content: [{ type: "text", text: `Failed to validate architecture: ${error.message}` }],

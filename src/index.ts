@@ -1,5 +1,7 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
+import { logger } from "./utils/logger.js";
 import type { Server as HttpServer } from "node:http";
 import { pathToFileURL } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -60,6 +62,14 @@ function createMcpServer(sessionId: string): Server {
                 type: "string",
                 description: "For Spring: The base package name (e.g., 'com.example.service')",
               },
+              dryRun: {
+                type: "boolean",
+                description: "If true, simulates the creation without writing any files."
+              },
+              overwrite: {
+                type: "boolean",
+                description: "If true, allows creating files/folders even if they already exist."
+              }
             },
             required: ["serviceName", "targetPath"],
           },
@@ -132,6 +142,14 @@ function createMcpServer(sessionId: string): Server {
                 enum: ["typescript", "spring", "auto"],
                 description: "The language context. Default is 'auto'.",
               },
+              dryRun: {
+                type: "boolean",
+                description: "If true, returns a diff preview without writing."
+              },
+              overwrite: {
+                type: "boolean",
+                description: "If true, overwrites any existing test file."
+              }
             },
             required: ["targetFilePath"],
           },
@@ -142,36 +160,42 @@ function createMcpServer(sessionId: string): Server {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    const startTime = Date.now();
 
-    console.log(`[MCP Tool Request] Session: ${sessionId} | Tool: ${name}`);
+    logger.info({ sessionId, toolName: name, args }, `[MCP Tool Request] Executing ${name}`);
 
     try {
+      let result;
       switch (name) {
         case "scaffold_ddd_service":
-          return await scaffoldDddService(args as any);
+          result = await scaffoldDddService(args as any);
+          break;
         case "validate_ddd_architecture":
-          return await validateDddArchitecture(args as any);
+          result = await validateDddArchitecture(args as any);
+          break;
         case "generate_communication_spec":
-          return await generateCommunicationSpec(args as any);
+          result = await generateCommunicationSpec(args as any);
+          break;
         case "analyze_service_dependencies":
-          return await analyzeServiceDependencies(args as any);
+          result = await analyzeServiceDependencies(args as any);
+          break;
         case "generate_test_stub":
-          return await generateTestStub(args as any);
+          result = await generateTestStub(args as any);
+          break;
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
+      
+      const durationMs = Date.now() - startTime;
+      logger.info({ sessionId, toolName: name, durationMs, status: "success" }, `[MCP Tool Success] ${name} completed in ${durationMs}ms`);
+      return result;
+
     } catch (error: any) {
-      console.error(`[MCP Tool Error] Session: ${sessionId} | Tool: ${name} | Error: ${error.message}`);
-      if (error.stack) {
-        console.error(error.stack);
-      }
+      const durationMs = Date.now() - startTime;
+      logger.error({ sessionId, toolName: name, durationMs, status: "error", errorCode: error.code || "UNKNOWN", error: error.message, stack: error.stack }, `[MCP Tool Error] Error executing tool ${name}: ${error.message}`);
+      
       return {
-        content: [
-          {
-            type: "text",
-            text: `Error executing tool ${name}: ${error.message}`,
-          },
-        ],
+        content: [{ type: "text", text: `Error executing tool ${name}: ${error.message}` }],
         isError: true,
       };
     }
@@ -187,6 +211,56 @@ async function createApp() {
 
   app.use(cors());
 
+  // 1. Request Size Limit Middleware
+  app.use((req, res, next) => {
+    const contentLength = parseInt(req.headers['content-length'] || "0", 10);
+    if (contentLength > 1024 * 1024) { // 1MB Limit
+      logger.warn({ ip: req.ip, contentLength }, "Payload Too Large");
+      return res.status(413).send("Payload Too Large");
+    }
+    next();
+  });
+
+  // 2. Rate Limiting Middleware
+  const limiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: parseInt(process.env.RATE_LIMIT_MAX || "100", 10), // Limit each IP
+    message: "Too many requests from this IP, please try again after a minute",
+    handler: (req, res, next, options) => {
+      logger.warn({ ip: req.ip }, "Rate limit exceeded");
+      res.status(options.statusCode).send(options.message);
+    }
+  });
+  app.use(limiter);
+
+  // 3. Auth Middleware
+  app.use((req, res, next) => {
+    if (req.path === "/health") return next();
+
+    const token = process.env.MCP_AUTH_TOKEN;
+    if (!token) {
+      if (!app.locals.warnedAuth) {
+        logger.warn("MCP_AUTH_TOKEN is not set. Server is running WITHOUT authentication!");
+        app.locals.warnedAuth = true;
+      }
+      return next();
+    }
+    
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      logger.info({ ip: req.ip, path: req.path }, "Missing or invalid Authorization header");
+      return res.status(401).json({ error: "Missing or invalid Authorization header" });
+    }
+
+    const providedToken = authHeader.split(" ")[1];
+    if (providedToken !== token) {
+      logger.warn({ ip: req.ip }, "Forbidden: Invalid token");
+      return res.status(403).json({ error: "Forbidden: Invalid token" });
+    }
+
+    next();
+  });
+
   app.get("/health", (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
@@ -194,7 +268,7 @@ async function createApp() {
   app.get("/mcp", async (req, res) => {
     const transport = new SSEServerTransport("/mcp/messages", res);
     const sessionId = transport.sessionId;
-    console.log(`[MCP] New SSE connection established. Session: ${sessionId}`);
+    logger.info({ sessionId }, `[MCP] New SSE connection established.`);
 
     const server = createMcpServer(sessionId);
     transports.set(sessionId, transport);
@@ -207,11 +281,11 @@ async function createApp() {
       }
       cleanedUp = true;
 
-      console.log(`[MCP] SSE connection closed. Session: ${sessionId}`);
+      logger.info({ sessionId }, `[MCP] SSE connection closed.`);
       transport.onclose = undefined;
       transports.delete(sessionId);
       servers.delete(sessionId);
-      await server.close().catch((err) => console.error("Error closing server struct", err));
+      await server.close().catch((err) => logger.error({ err }, "Error closing server struct"));
     };
 
     transport.onclose = () => {
@@ -238,7 +312,7 @@ async function createApp() {
     try {
       await transport.handlePostMessage(req, res);
     } catch (err: any) {
-      console.error(`[MCP] Error handling message for session ${sessionId}:`, err);
+      logger.error({ sessionId, err }, `[MCP] Error handling message`);
       res.status(500).send("Message handling failed.");
     }
   });
@@ -287,14 +361,14 @@ const isMainModule = process.argv[1] !== undefined && import.meta.url === pathTo
 
 if (isMainModule) {
   const running = await startServer(Number(process.env.PORT ?? 3001));
-  console.log(`DDD+MSA MCP Server is running in SSE mode: http://localhost:${running.port}/mcp`);
-  console.log(`Health check URL: http://localhost:${running.port}/health`);
-  console.log("Add this URL to your Vibe Coding IDE to use the tools over the network.");
+  logger.info(`DDD+MSA MCP Server is running in SSE mode: http://localhost:${running.port}/mcp`);
+  logger.info(`Health check URL: http://localhost:${running.port}/health`);
+  logger.info("Add this URL to your Vibe Coding IDE to use the tools over the network.");
 
   const shutdown = async () => {
-    console.log("\n[Server] Received shutdown signal. Shutting down gracefully...");
+    logger.info("[Server] Received shutdown signal. Shutting down gracefully...");
     await running.close();
-    console.log("[Server] Closed HTTP server. Process exiting.");
+    logger.info("[Server] Closed HTTP server. Process exiting.");
     process.exit(0);
   };
 

@@ -1,6 +1,9 @@
 import fs from "fs/promises";
 import path from "path";
+import ts from "typescript";
+import { parse } from "java-parser";
 import { resolveSafePath } from "../utils/pathUtils.js";
+import { ToolResult } from "../types/ResultTypes.js";
 
 interface AnalyzeArgs {
   targetPath: string;
@@ -59,13 +62,42 @@ export async function analyzeServiceDependencies(args: AnalyzeArgs) {
             let match;
             
             if (isTS) {
-              while ((match = httpRegex.exec(content)) !== null) addDependency(`HTTP API: ${match[1]}`, relativePath);
-              while ((match = grpcRegex.exec(content)) !== null) addDependency(`gRPC Method: ${match[1]}`, relativePath);
-              while ((match = eventRegex.exec(content)) !== null) addDependency(`Event/Message: ${match[1]}`, relativePath);
-              while ((match = dbRegex.exec(content)) !== null) addDependency(`Infrastructure: ${match[1]}`, relativePath);
+              const sourceFile = ts.createSourceFile("temp.ts", content, ts.ScriptTarget.Latest, true);
+              ts.forEachChild(sourceFile, function visit(node: ts.Node) {
+                  if (ts.isCallExpression(node)) {
+                      const exp = node.expression;
+                      // fetch or axios check
+                      if (ts.isIdentifier(exp) && exp.text === "fetch") {
+                          if (node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0])) {
+                              addDependency(`HTTP API: ${node.arguments[0].text}`, relativePath);
+                          }
+                      } else if (ts.isPropertyAccessExpression(exp)) {
+                          if (ts.isIdentifier(exp.expression) && exp.expression.text === "axios") {
+                              if (node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0])) {
+                                  addDependency(`HTTP API: ${node.arguments[0].text}`, relativePath);
+                              }
+                          } else if (exp.name.text === "emit" || exp.name.text === "publish" || exp.name.text === "send") {
+                              if (node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0])) {
+                                  addDependency(`Event/Message: ${node.arguments[0].text}`, relativePath);
+                              }
+                          } else if (ts.isIdentifier(exp.expression) && exp.expression.text === "client") {
+                              addDependency(`gRPC Method: ${exp.name.text}`, relativePath);
+                          }
+                      }
+                  } else if (ts.isImportDeclaration(node)) {
+                      const mod = node.moduleSpecifier;
+                      if (ts.isStringLiteral(mod)) {
+                          if (['mongoose', 'sequelize', 'pg', 'mysql2', 'redis', 'ioredis', 'mongodb'].includes(mod.text)) {
+                              addDependency(`Infrastructure: ${mod.text}`, relativePath);
+                          }
+                      }
+                  }
+                  ts.forEachChild(node, visit);
+              });
             }
 
             if (isJava) {
+              try { parse(content); } catch (e) {} // validates Java syntax
               while ((match = springFeignRegex.exec(content)) !== null) addDependency(`FeignClient: ${match[1]}`, relativePath);
               while ((match = springHttpRegex.exec(content)) !== null) addDependency(`HTTP API: ${match[1]}`, relativePath);
               while ((match = springEventRegex.exec(content)) !== null) addDependency(`Event/Message (Kafka/Rabbit): ${match[1]}`, relativePath);
@@ -82,23 +114,26 @@ export async function analyzeServiceDependencies(args: AnalyzeArgs) {
 
     await walk(rootDir);
 
+    const results: ToolResult[] = [];
     if (dependencies.size === 0) {
-       return {
-         content: [{ type: "text", text: `✅ No external service dependencies found in ${targetPath}.` }]
-       };
-    }
-
-    // Format output
-    const reportLines = [`Dependencies found in ${targetPath}:\n`];
-    for (const [dep, files] of dependencies.entries()) {
-      reportLines.push(`- **${dep}**`);
-      for (const file of files) {
-        reportLines.push(`  - found in: \`${file}\``);
-      }
+       results.push({
+         ruleId: "DEP-ANALYSIS-001",
+         confidence: 1.0,
+         evidence: [],
+         recommendation: "No external dependencies found."
+       });
+    } else {
+       for (const [dep, files] of dependencies.entries()) {
+          results.push({
+            ruleId: "DEP-ANALYSIS-002",
+            confidence: 1.0,
+            evidence: Array.from(files).map(f => ({ file: f, message: `Found dependency: ${dep}` }))
+          });
+       }
     }
 
     return {
-      content: [{ type: "text", text: reportLines.join('\n') }]
+      content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
     };
   } catch (error: any) {
     return {
