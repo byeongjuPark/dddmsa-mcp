@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import * as Diff from "diff";
 import { resolveSafePath } from "../utils/pathUtils.js";
+import { ToolResult } from "../types/ResultTypes.js";
 
 interface GenerateTestArgs {
   targetFilePath: string;
@@ -117,12 +118,17 @@ describe('${className}', () => {
       let diffStr = "";
       if (existingContent) {
         const patch = Diff.createTwoFilesPatch(testFilePath, testFilePath, existingContent, testContent, "Existing", "New");
-        diffStr = `[DRY RUN] Diff of modifications to ${testFilePath}:\n\n${patch}`;
+        diffStr = `[DRY RUN] Diff of modifications:\n\n${patch}`;
       } else {
-        diffStr = `[DRY RUN] Would create ${testFilePath} with the following content:\n\n${testContent}`;
+        diffStr = `[DRY RUN] Would create with content:\n\n${testContent}`;
       }
+      const results: ToolResult[] = [{
+        ruleId: "STUB-DRY",
+        confidence: 1.0,
+        evidence: [{ file: testFilePath, message: diffStr }]
+      }];
       return {
-        content: [{ type: "text", text: diffStr }]
+        content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
       };
     }
     
@@ -132,22 +138,23 @@ describe('${className}', () => {
     // Write the test stub
     await fs.writeFile(fullTestPath, testContent);
 
+    const successResults: ToolResult[] = [{
+       ruleId: "STUB-WRITE",
+       confidence: 1.0,
+       evidence: [{ file: fullTestPath, message: "Stub generated successfully" }]
+    }];
     return {
-      content: [
-        {
-          type: "text",
-          text: `✅ Successfully generated test stub at: ${testFilePath}\n\nAI Assistant: Please read this generated file and implement the actual mock setup and test logic according to the source file.`,
-        },
-      ],
+      content: [{ type: "text", text: JSON.stringify(successResults, null, 2) }]
     };
   } catch (error: any) {
+    const errorResults: ToolResult[] = [{
+       ruleId: "STUB-FAIL",
+       confidence: 0,
+       errorCode: "STUB_ERR",
+       evidence: [{ file: targetFilePath, message: error.message }]
+    }];
     return {
-      content: [
-        {
-          type: "text",
-          text: `Failed to generate test stub: ${error.message}`,
-        },
-      ],
+      content: [{ type: "text", text: JSON.stringify(errorResults, null, 2) }],
       isError: true,
     };
   }
