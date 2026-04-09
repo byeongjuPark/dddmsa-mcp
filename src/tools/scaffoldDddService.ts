@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { resolveSafePath } from "../utils/pathUtils.js";
+import { ToolResult } from "../types/ResultTypes.js";
 
 interface ScaffoldArgs {
   targetPath: string;
@@ -85,6 +86,7 @@ export async function scaffoldDddService(args: ScaffoldArgs) {
 
     let directories: string[] = [];
     const plannedWrites: string[] = [];
+    let gradleContent = "";
     
     if (language === "spring") {
       const pkg = basePackage || "com.example.service";
@@ -107,8 +109,7 @@ export async function scaffoldDddService(args: ScaffoldArgs) {
       ];
 
       // Add default build.gradle
-      await fs.mkdir(rootDir, { recursive: true });
-      const gradleContent = `plugins {
+      gradleContent = `plugins {
     id 'java'
     id 'org.springframework.boot' version '3.2.0'
     id 'io.spring.dependency-management' version '1.1.4'
@@ -127,7 +128,7 @@ dependencies {
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
 `;
-      await fs.writeFile(path.join(rootDir, "build.gradle"), gradleContent);
+      plannedWrites.push(path.join(rootDir, "build.gradle"));
       
     } else {
       directories = [
@@ -153,14 +154,21 @@ dependencies {
     plannedWrites.push(path.join(rootDir, "README.md"));
 
     if (dryRun) {
+      const results: ToolResult[] = [{
+        ruleId: "SCAFFOLD-DRY",
+        confidence: 1.0,
+        evidence: plannedWrites.map(p => ({ file: p, message: "Planned directory or file creation" })),
+        recommendation: "Review planned scaffold targets before writing"
+      }];
       return {
-        content: [
-          {
-            type: "text",
-            text: `[DRY RUN] Scaffold planned for '${serviceName}' at ${rootDir}:\n` + plannedWrites.map(p => `+ ${p}`).join('\n')
-          }
-        ]
+        content: [{ type: "text", text: JSON.stringify(results, null, 2) }]
       }
+    }
+
+    await fs.mkdir(rootDir, { recursive: true });
+    
+    if (gradleContent) {
+      await fs.writeFile(path.join(rootDir, "build.gradle"), gradleContent);
     }
 
     for (const dir of directories) {
@@ -173,22 +181,24 @@ dependencies {
     const readmeContent = `# ${serviceName} Microservice\n\nThis service follows Domain-Driven Design principles.\nLanguage: ${language}\n`;
     await fs.writeFile(path.join(rootDir, "README.md"), readmeContent);
 
+    const results: ToolResult[] = [{
+       ruleId: "SCAFFOLD-WRITE",
+       confidence: 1.0,
+       evidence: [{ file: rootDir, message: "Scaffold successful" }]
+    }];
+
     return {
-      content: [
-        {
-          type: "text",
-          text: `Successfully scaffolded ${language} DDD service '${serviceName}' at ${path.join(process.cwd(), targetPath)} (Base Package: ${basePackage || 'N/A'})`,
-        },
-      ],
+      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
     };
   } catch (error: any) {
+    const errorResults: ToolResult[] = [{
+       ruleId: "SCAFFOLD-FAIL",
+       confidence: 0,
+       errorCode: "SCAFFOLD_ERR",
+       evidence: [{ file: targetPath, message: error.message }]
+    }];
     return {
-      content: [
-        {
-          type: "text",
-          text: `Failed to scaffold DDD service: ${error.message}`,
-        },
-      ],
+      content: [{ type: "text", text: JSON.stringify(errorResults, null, 2) }],
       isError: true,
     };
   }
