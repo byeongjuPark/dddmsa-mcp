@@ -2,12 +2,15 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { logger } from "./utils/logger.js";
+import { randomUUID } from "node:crypto";
 import type { Server as HttpServer } from "node:http";
 import { pathToFileURL } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
+  isInitializeRequest,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { scaffoldDddService } from "./tools/scaffoldDddService.js";
@@ -15,6 +18,8 @@ import { validateDddArchitecture } from "./tools/validateDddArchitecture.js";
 import { generateCommunicationSpec } from "./tools/generateCommunicationSpec.js";
 import { analyzeServiceDependencies } from "./tools/analyzeServiceDependencies.js";
 import { generateTestStub } from "./tools/generateTestStub.js";
+import { inspectWorkspace } from "./tools/inspectWorkspace.js";
+import { explainArchitectureViolation, suggestRefactoringPlan } from "./tools/refactoringGuidance.js";
 
 export interface RunningServer {
   port: number;
@@ -38,6 +43,56 @@ function createMcpServer(sessionId: string): Server {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
+        {
+          name: "explain_architecture_violation",
+          description: "Explain an architecture finding and why it matters.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              finding: {
+                type: "object",
+                description: "A finding returned by validate_ddd_architecture or analyze_service_dependencies.",
+              },
+            },
+            required: ["finding"],
+          },
+        },
+        {
+          name: "suggest_refactoring_plan",
+          description: "Turn an architecture finding into a concrete refactoring plan and optional dry-run patch preview.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              finding: {
+                type: "object",
+                description: "A finding returned by validate_ddd_architecture or analyze_service_dependencies.",
+              },
+              targetPath: {
+                type: "string",
+                description: "Workspace root used to resolve evidence files. Defaults to current workspace.",
+              },
+              dryRun: {
+                type: "boolean",
+                description: "If true, returns a patch preview without writing files.",
+              },
+            },
+            required: ["finding"],
+          },
+        },
+        {
+          name: "inspect_workspace",
+          description:
+            "Inspect a workspace and build a structured project model for DDD/MSA architecture analysis.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              targetPath: {
+                type: "string",
+                description: "The workspace or service root to inspect. Defaults to the current workspace.",
+              },
+            },
+          },
+        },
         {
           name: "scaffold_ddd_service",
           description: "Scaffold a new microservice adopting DDD structure.",
@@ -175,6 +230,15 @@ function createMcpServer(sessionId: string): Server {
     try {
       let result;
       switch (name) {
+        case "explain_architecture_violation":
+          result = await explainArchitectureViolation(args as any);
+          break;
+        case "suggest_refactoring_plan":
+          result = await suggestRefactoringPlan(args as any);
+          break;
+        case "inspect_workspace":
+          result = await inspectWorkspace(args as any);
+          break;
         case "scaffold_ddd_service":
           result = await scaffoldDddService(args as any);
           break;
@@ -229,8 +293,10 @@ function createMcpServer(sessionId: string): Server {
 
 async function createApp() {
   const app = express();
-  const transports = new Map<string, SSEServerTransport>();
-  const servers = new Map<string, Server>();
+  const sseTransports = new Map<string, SSEServerTransport>();
+  const sseServers = new Map<string, Server>();
+  const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
+  const streamableServers = new Map<string, Server>();
 
   app.use(cors());
 
@@ -284,18 +350,43 @@ async function createApp() {
     next();
   });
 
+  app.use((req, res, next) => {
+    if (req.path === "/health") return next();
+
+    const allowedOrigins = getAllowedOrigins();
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.length > 0 && !isOriginAllowed(origin, allowedOrigins)) {
+      logger.warn({ origin, path: req.path }, "Blocked request from disallowed Origin");
+      return res.status(403).json({ error: "Forbidden: Origin is not allowed" });
+    }
+
+    next();
+  });
+
   app.get("/health", (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
   app.get("/mcp", async (req, res) => {
+    const streamableSessionId = getHeaderValue(req.headers["mcp-session-id"]);
+    if (streamableSessionId) {
+      const transport = streamableTransports.get(streamableSessionId);
+      if (!transport) {
+        res.status(404).send("Streamable HTTP session not found or inactive.");
+        return;
+      }
+
+      await transport.handleRequest(req, res);
+      return;
+    }
+
     const transport = new SSEServerTransport("/mcp/messages", res);
     const sessionId = transport.sessionId;
     logger.info({ sessionId }, `[MCP] New SSE connection established.`);
 
     const server = createMcpServer(sessionId);
-    transports.set(sessionId, transport);
-    servers.set(sessionId, server);
+    sseTransports.set(sessionId, transport);
+    sseServers.set(sessionId, server);
     let cleanedUp = false;
 
     const cleanup = async () => {
@@ -306,8 +397,8 @@ async function createApp() {
 
       logger.info({ sessionId }, `[MCP] SSE connection closed.`);
       transport.onclose = undefined;
-      transports.delete(sessionId);
-      servers.delete(sessionId);
+      sseTransports.delete(sessionId);
+      sseServers.delete(sessionId);
       await server.close().catch((err) => logger.error({ err }, "Error closing server struct"));
     };
 
@@ -318,6 +409,14 @@ async function createApp() {
     await server.connect(transport);
   });
 
+  app.post("/mcp", express.json({ limit: "1mb" }), async (req, res) => {
+    await handleStreamableHttpRequest(req, res);
+  });
+
+  app.delete("/mcp", async (req, res) => {
+    await handleStreamableHttpRequest(req, res);
+  });
+
   app.post("/mcp/messages", async (req, res) => {
     const sessionId = req.query.sessionId as string;
 
@@ -326,7 +425,7 @@ async function createApp() {
       return;
     }
 
-    const transport = transports.get(sessionId);
+    const transport = sseTransports.get(sessionId);
     if (!transport) {
       res.status(404).send("Session not found or inactive.");
       return;
@@ -340,22 +439,133 @@ async function createApp() {
     }
   });
 
+  async function handleStreamableHttpRequest(req: express.Request, res: express.Response) {
+    const sessionId = getHeaderValue(req.headers["mcp-session-id"]);
+    let transport: StreamableHTTPServerTransport | undefined;
+
+    if (sessionId) {
+      transport = streamableTransports.get(sessionId);
+      if (!transport) {
+        res.status(404).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Streamable HTTP session not found or inactive" },
+          id: null,
+        });
+        return;
+      }
+    } else if (req.method === "POST" && isInitializeRequest(req.body)) {
+      const server = createMcpServer("streamable-pending");
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (initializedSessionId) => {
+          logger.info({ sessionId: initializedSessionId }, "[MCP] Streamable HTTP session initialized.");
+          if (transport) {
+            streamableTransports.set(initializedSessionId, transport);
+            streamableServers.set(initializedSessionId, server);
+          }
+        },
+      });
+
+      let cleanedUp = false;
+
+      const cleanup = async () => {
+        if (cleanedUp) {
+          return;
+        }
+        cleanedUp = true;
+
+        const activeSessionId = transport?.sessionId;
+        if (activeSessionId) {
+          streamableTransports.delete(activeSessionId);
+          streamableServers.delete(activeSessionId);
+        }
+        await server.close().catch((err) => logger.error({ err }, "Error closing streamable server"));
+      };
+
+      transport.onclose = () => {
+        void cleanup();
+      };
+
+      await server.connect(transport);
+    } else {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid Streamable HTTP session or initialize request" },
+        id: null,
+      });
+      return;
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  }
+
   const closeSessions = async () => {
     await Promise.all(
-      Array.from(transports.values()).map(async (transport) => {
+      Array.from(sseTransports.values()).map(async (transport) => {
         await transport.close().catch(() => {});
       })
     );
     await Promise.all(
-      Array.from(servers.values()).map(async (server) => {
+      Array.from(sseServers.values()).map(async (server) => {
         await server.close().catch(() => {});
       })
     );
-    transports.clear();
-    servers.clear();
+    await Promise.all(
+      Array.from(streamableTransports.values()).map(async (transport) => {
+        await transport.close().catch(() => {});
+      })
+    );
+    await Promise.all(
+      Array.from(streamableServers.values()).map(async (server) => {
+        await server.close().catch(() => {});
+      })
+    );
+    sseTransports.clear();
+    sseServers.clear();
+    streamableTransports.clear();
+    streamableServers.clear();
   };
 
   return { app, closeSessions };
+}
+
+function getHeaderValue(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) {
+    return value[0];
+  }
+  return value;
+}
+
+function getAllowedOrigins(): string[] {
+  const configuredOrigins = process.env.MCP_ALLOWED_ORIGINS;
+  if (configuredOrigins) {
+    return configuredOrigins
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean);
+  }
+
+  return ["http://localhost", "http://127.0.0.1"];
+}
+
+function isOriginAllowed(origin: string, allowedOrigins: string[]): boolean {
+  if (allowedOrigins.includes(origin)) {
+    return true;
+  }
+
+  try {
+    const parsedOrigin = new URL(origin);
+    return allowedOrigins.some((allowedOrigin) => {
+      const parsedAllowed = new URL(allowedOrigin);
+      return (
+        parsedAllowed.protocol === parsedOrigin.protocol &&
+        parsedAllowed.hostname === parsedOrigin.hostname &&
+        parsedAllowed.port === ""
+      );
+    });
+  } catch {
+    return false;
+  }
 }
 
 export async function startServer(port = Number(process.env.PORT ?? 3001)): Promise<RunningServer> {

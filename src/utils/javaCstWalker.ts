@@ -2,7 +2,7 @@ import { parse } from "java-parser";
 
 interface ASTExtraction {
     imports: string[];
-    endpoints: { method: string, path: string }[];
+    endpoints: { method: string, path: string, line?: number }[];
     dependencies: string[];
 }
 
@@ -53,7 +53,7 @@ export function extractJavaDataFromAST(content: string): ASTExtraction {
                     if (!fullPath.startsWith('/')) fullPath = '/' + fullPath;
                     if (fullPath.endsWith('/') && fullPath.length > 1) fullPath = fullPath.slice(0, -1);
 
-                    extraction.endpoints.push({ method, path: fullPath });
+                    extraction.endpoints.push({ method, path: fullPath, line: node.location?.startLine });
                 }
             }
         }

@@ -37,4 +37,36 @@ describe('Extractors Golden Fixture tests', () => {
         expect(content).toContain('http://api.external.com/users');
         expect(content).toContain('HTTP API');
     });
+
+    it('should detect shared database resources across service directories', async () => {
+        const fixturePath = path.join('test', 'fixtures', 'shared-db');
+        const res = await analyzeServiceDependencies({ targetPath: fixturePath });
+
+        expect(res.isError).toBeFalsy();
+        const findings = JSON.parse(res.content[0].text);
+        const sharedDbFinding = findings.find((finding: any) => finding.ruleId === 'MSA-DB-SHARED');
+
+        expect(sharedDbFinding).toBeTruthy();
+        expect(sharedDbFinding.evidence).toHaveLength(2);
+        expect(JSON.stringify(sharedDbFinding)).toContain('order-service');
+        expect(JSON.stringify(sharedDbFinding)).toContain('billing-service');
+    });
+
+    it('should build a service graph and detect cycles and hotspots', async () => {
+        const fixturePath = path.join('test', 'fixtures', 'service-graph');
+        const res = await analyzeServiceDependencies({ targetPath: fixturePath });
+
+        expect(res.isError).toBeFalsy();
+        const findings = JSON.parse(res.content[0].text);
+        const graph = findings.find((finding: any) => finding.ruleId === 'DEP-GRAPH');
+        const cycle = findings.find((finding: any) => finding.ruleId === 'DEP-GRAPH-CYCLE');
+        const hotspot = findings.find((finding: any) => finding.ruleId === 'DEP-GRAPH-HOTSPOT');
+
+        expect(graph).toBeTruthy();
+        expect(JSON.stringify(graph)).toContain('order-service -> billing-service [sync-http]');
+        expect(JSON.stringify(graph)).toContain('order-service -> order.created [async-message]');
+        expect(JSON.stringify(cycle)).toContain('billing-service');
+        expect(JSON.stringify(cycle)).toContain('order-service');
+        expect(JSON.stringify(hotspot)).toContain('reporting-service has 4 outgoing');
+    });
 });

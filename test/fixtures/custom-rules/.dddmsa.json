@@ -1,0 +1,19 @@
+{
+  "layers": {
+    "domain": ["core"],
+    "application": ["usecases"],
+    "infrastructure": ["adapters"],
+    "presentation": ["api"]
+  },
+  "rules": [
+    {
+      "id": "CUSTOM-001",
+      "fromLayer": "domain",
+      "disallowLayers": ["infrastructure"],
+      "severity": "error",
+      "recommendation": "Keep core model independent from adapters."
+    }
+  ],
+  "ignorePaths": ["node_modules", "dist", "build", ".git"]
+}
+

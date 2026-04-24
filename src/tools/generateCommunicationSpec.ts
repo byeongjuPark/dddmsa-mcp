@@ -13,12 +13,32 @@ interface GenerateSpecArgs {
   overwrite?: boolean;
 }
 
+interface EndpointSpec {
+  method: string;
+  path: string;
+  file?: string;
+  line?: number;
+  requestType?: string;
+  responseType?: string;
+}
+
+interface JsonSchema {
+  type?: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  items?: JsonSchema;
+  enum?: string[];
+  format?: string;
+  $ref?: string;
+}
+
 export async function generateCommunicationSpec(args: GenerateSpecArgs) {
   const { sourcePath, outputFormat, dryRun = false, overwrite = false } = args;
   const targetDir = resolveSafePath(process.cwd(), sourcePath);
 
   try {
-    const endpoints: { method: string, path: string }[] = [];
+    const endpoints: EndpointSpec[] = [];
+    const schemas = new Map<string, JsonSchema>();
     const warnings: string[] = [];
 
     async function walk(dir: string) {
@@ -36,8 +56,10 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
              if (isTS || isJava) {
                try {
                  const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
+                 const relativePath = path.relative(targetDir, path.join(dir, entry.name));
                  if (isTS) {
                    const sourceFile = ts.createSourceFile("temp.ts", content, ts.ScriptTarget.Latest, true);
+                   collectTypeSchemas(sourceFile, schemas);
                    ts.forEachChild(sourceFile, function visit(node: ts.Node) {
                        if (ts.isCallExpression(node)) {
                            const exp = node.expression;
@@ -45,7 +67,15 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
                                const method = exp.name.text;
                                if (['get', 'post', 'put', 'delete', 'patch'].includes(method)) {
                                    if (node.arguments.length > 0 && ts.isStringLiteral(node.arguments[0])) {
-                                        endpoints.push({ method, path: node.arguments[0].text });
+                                        const signature = extractHandlerSignature(node.arguments[1]);
+                                        const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+                                        endpoints.push({
+                                          method,
+                                          path: node.arguments[0].text,
+                                          file: relativePath,
+                                          line,
+                                          ...signature,
+                                        });
                                    }
                                }
                            }
@@ -56,8 +86,10 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
                  if (isJava) {
                    try {
                        const extraction = extractJavaDataFromAST(content);
-                       extraction.endpoints.forEach(ep => endpoints.push(ep));
-                   } catch(e) {}
+                       extraction.endpoints.forEach(ep => endpoints.push({ ...ep, file: relativePath }));
+                   } catch(e: any) {
+                       warnings.push(`Warning: Could not parse Java file ${path.join(dir, entry.name)}: ${e.message}`);
+                   }
                  }
                } catch (err: any) {
                  warnings.push(`Warning: Could not read file ${path.join(dir, entry.name)}: ${err.message}`);
@@ -85,9 +117,42 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
       const pathsObj: any = {};
       for (const ep of endpoints) {
         if (!pathsObj[ep.path]) pathsObj[ep.path] = {};
-        pathsObj[ep.path][ep.method] = {
+        const operation: any = {
           summary: `Auto-detected ${ep.method.toUpperCase()} endpoint`,
-          responses: { "200": { description: "OK" } }
+          responses: {
+            "200": {
+              description: "OK",
+              ...(ep.responseType ? {
+                content: {
+                  "application/json": {
+                    schema: schemaForType(ep.responseType, schemas),
+                  },
+                },
+              } : {}),
+            },
+          },
+        };
+
+        if (ep.file || ep.line) {
+          operation["x-source"] = {
+            ...(ep.file ? { file: ep.file } : {}),
+            ...(ep.line ? { line: ep.line } : {}),
+          };
+        }
+
+        if (ep.requestType && !["get", "delete"].includes(ep.method)) {
+          operation.requestBody = {
+            required: true,
+            content: {
+              "application/json": {
+                schema: schemaForType(ep.requestType, schemas),
+              },
+            },
+          };
+        }
+
+        pathsObj[ep.path][ep.method] = {
+          ...operation,
         };
       }
 
@@ -97,11 +162,15 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
           title: "Generated Service API",
           version: "1.0.0"
         },
-        paths: pathsObj
+        paths: pathsObj,
+        ...(schemas.size > 0 ? { components: { schemas: Object.fromEntries(schemas.entries()) } } : {})
       }, null, 2);
     } else if (outputFormat === "grpc") {
       fileName = "service.proto";
-      const rpcLines = endpoints.map((ep, i) => `  rpc Handle${ep.method.toUpperCase()}Endpoint${i} (Empty) returns (ResponseType);`).join("\n");
+      const rpcLines = endpoints.map((ep, i) => {
+        const sourceComment = ep.file ? `  // source: ${ep.file}${ep.line ? `:${ep.line}` : ""}\n` : "";
+        return `${sourceComment}  rpc Handle${ep.method.toUpperCase()}Endpoint${i} (Empty) returns (ResponseType);`;
+      }).join("\n");
       specContent = `syntax = "proto3";\n\npackage service;\n\nservice GeneratedService {\n${rpcLines}\n}\n\nmessage Empty {}\nmessage ResponseType {\n  string status = 1;\n}\n`;
     } else {
       throw new Error("Unsupported output format");
@@ -144,7 +213,11 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
     results.push({
       ruleId: "SPEC-GEN",
       confidence: 1.0,
-      evidence: endpoints.map(ep => ({ file: outputPath, message: `Discovered endpoint ${ep.method.toUpperCase()} ${ep.path}` })),
+      evidence: endpoints.map(ep => ({
+        file: ep.file ?? outputPath,
+        line: ep.line,
+        message: `Discovered endpoint ${ep.method.toUpperCase()} ${ep.path}${ep.requestType ? ` request=${ep.requestType}` : ""}${ep.responseType ? ` response=${ep.responseType}` : ""}`,
+      })),
     });
 
     if (warnings.length > 0) {
@@ -170,4 +243,116 @@ export async function generateCommunicationSpec(args: GenerateSpecArgs) {
       isError: true,
     };
   }
+}
+
+function collectTypeSchemas(sourceFile: ts.SourceFile, schemas: Map<string, JsonSchema>) {
+  ts.forEachChild(sourceFile, function visit(node: ts.Node) {
+    if (ts.isInterfaceDeclaration(node) || ts.isClassDeclaration(node)) {
+      const name = node.name?.text;
+      if (name) {
+        const properties: Record<string, JsonSchema> = {};
+        const required: string[] = [];
+        for (const member of node.members) {
+          if (!ts.isPropertySignature(member) && !ts.isPropertyDeclaration(member)) {
+            continue;
+          }
+          const propertyName = getPropertyName(member.name);
+          if (!propertyName) {
+            continue;
+          }
+          properties[propertyName] = typeNodeToSchema(member.type);
+          if (!member.questionToken) {
+            required.push(propertyName);
+          }
+        }
+        schemas.set(name, {
+          type: "object",
+          properties,
+          ...(required.length > 0 ? { required } : {}),
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  });
+}
+
+function extractHandlerSignature(handler: ts.Node | undefined): Pick<EndpointSpec, "requestType" | "responseType"> {
+  if (!handler) {
+    return {};
+  }
+
+  if (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler)) {
+    return {
+      requestType: extractRequestType(handler.parameters[0]?.type),
+      responseType: extractResponseType(handler.type),
+    };
+  }
+
+  return {};
+}
+
+function extractRequestType(typeNode: ts.TypeNode | undefined): string | undefined {
+  if (!typeNode) {
+    return undefined;
+  }
+  if (ts.isTypeReferenceNode(typeNode)) {
+    const typeName = typeNode.typeName.getText();
+    if (typeName === "Request" && typeNode.typeArguments?.[2]) {
+      return typeNode.typeArguments[2].getText();
+    }
+    return typeName;
+  }
+  return undefined;
+}
+
+function extractResponseType(typeNode: ts.TypeNode | undefined): string | undefined {
+  if (!typeNode) {
+    return undefined;
+  }
+  if (ts.isTypeReferenceNode(typeNode)) {
+    const typeName = typeNode.typeName.getText();
+    if (typeName === "Promise" && typeNode.typeArguments?.[0]) {
+      return typeNode.typeArguments[0].getText();
+    }
+    return typeName;
+  }
+  return undefined;
+}
+
+function schemaForType(typeName: string, schemas: Map<string, JsonSchema>): JsonSchema {
+  if (schemas.has(typeName)) {
+    return { $ref: `#/components/schemas/${typeName}` };
+  }
+  return typeNodeTextToSchema(typeName);
+}
+
+function typeNodeToSchema(typeNode: ts.TypeNode | undefined): JsonSchema {
+  if (!typeNode) {
+    return {};
+  }
+  return typeNodeTextToSchema(typeNode.getText());
+}
+
+function typeNodeTextToSchema(typeText: string): JsonSchema {
+  const normalized = typeText.trim();
+  if (normalized === "string") return { type: "string" };
+  if (normalized === "number") return { type: "number" };
+  if (normalized === "boolean") return { type: "boolean" };
+  if (normalized === "Date") return { type: "string", format: "date-time" };
+  if (normalized.endsWith("[]")) return { type: "array", items: typeNodeTextToSchema(normalized.slice(0, -2)) };
+  if (normalized.startsWith("Array<") && normalized.endsWith(">")) {
+    return { type: "array", items: typeNodeTextToSchema(normalized.slice(6, -1)) };
+  }
+  const literalUnion = normalized.split("|").map((part) => part.trim().replace(/^["']|["']$/g, ""));
+  if (literalUnion.length > 1 && literalUnion.every(Boolean)) {
+    return { type: "string", enum: literalUnion };
+  }
+  return { $ref: `#/components/schemas/${normalized}` };
+}
+
+function getPropertyName(name: ts.PropertyName): string | undefined {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+    return name.text;
+  }
+  return undefined;
 }
